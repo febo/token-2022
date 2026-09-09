@@ -17,6 +17,7 @@ use {
         processor::Processor,
     },
     bytemuck::Zeroable,
+    pinocchio::{AccountView, Resize},
     solana_account_info::{next_account_info, AccountInfo},
     solana_address::Address,
     solana_clock::Clock,
@@ -25,6 +26,7 @@ use {
     solana_nullable::MaybeNull,
     solana_program_error::{ProgramError, ProgramResult},
     solana_rent::Rent,
+    solana_sdk_ids::system_program,
     solana_system_interface::instruction as system_instruction,
     solana_sysvar::Sysvar,
     solana_zero_copy::unaligned::{Bool, U64},
@@ -58,23 +60,25 @@ use {
         state::Account,
     },
     spl_token_confidential_transfer_proof_extraction::{
-        instruction::verify_and_extract_context, transfer::TransferProofContext,
+        instruction::{next_account_view, verify_and_extract_context},
+        transfer::TransferProofContext,
         transfer_with_fee::TransferWithFeeProofContext,
     },
 };
 
 /// Processes an [`InitializeMint`] instruction.
 fn process_initialize_mint(
-    accounts: &[AccountInfo],
+    accounts: &mut [AccountView],
     authority: &MaybeNull<Address>,
     auto_approve_new_account: Bool,
     auditor_encryption_pubkey: &MaybeNull<PodElGamalPubkey>,
 ) -> ProgramResult {
-    let account_info_iter = &mut accounts.iter();
-    let mint_info = next_account_info(account_info_iter)?;
+    let [mint_info, ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
 
-    check_program_account(mint_info.owner)?;
-    let mint_data = &mut mint_info.data.borrow_mut();
+    check_program_account(mint_info.owner())?;
+    let mint_data = &mut mint_info.try_borrow_mut()?;
     let mut mint = PodStateWithExtensionsMut::<PodMint>::unpack_uninitialized(mint_data)?;
     let confidential_transfer_mint = mint.init_extension::<ConfidentialTransferMint>(true)?;
 
@@ -87,16 +91,16 @@ fn process_initialize_mint(
 
 /// Processes an [`UpdateMint`] instruction.
 fn process_update_mint(
-    accounts: &[AccountInfo],
+    accounts: &mut [AccountView],
     auto_approve_new_account: Bool,
     auditor_encryption_pubkey: &MaybeNull<PodElGamalPubkey>,
 ) -> ProgramResult {
-    let account_info_iter = &mut accounts.iter();
-    let mint_info = next_account_info(account_info_iter)?;
-    let authority_info = next_account_info(account_info_iter)?;
+    let [mint_info, authority_info, ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
 
-    check_program_account(mint_info.owner)?;
-    let mint_data = &mut mint_info.data.borrow_mut();
+    check_program_account(mint_info.owner())?;
+    let mint_data = &mut mint_info.try_borrow_mut()?;
     let mut mint = PodStateWithExtensionsMut::<PodMint>::unpack(mint_data)?;
     let confidential_transfer_mint = mint.get_extension_mut::<ConfidentialTransferMint>()?;
     let maybe_confidential_transfer_mint_authority: Option<Address> =
@@ -104,11 +108,11 @@ fn process_update_mint(
     let confidential_transfer_mint_authority =
         maybe_confidential_transfer_mint_authority.ok_or(TokenError::NoAuthorityExists)?;
 
-    if !authority_info.is_signer {
+    if !authority_info.is_signer() {
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    if confidential_transfer_mint_authority != *authority_info.key {
+    if confidential_transfer_mint_authority != *authority_info.address() {
         return Err(TokenError::OwnerMismatch.into());
     }
 
@@ -125,18 +129,20 @@ enum ElGamalPubkeySource<'a> {
 /// Processes a [`ConfigureAccountWithRegistry`] instruction.
 fn process_configure_account_with_registry(
     program_id: &Address,
-    accounts: &[AccountInfo],
+    accounts: &mut [AccountView],
 ) -> ProgramResult {
-    let account_info_iter = &mut accounts.iter();
-    let token_account_info = next_account_info(account_info_iter)?;
-    let _mint_info = next_account_info(account_info_iter)?;
-    let elgamal_registry_account = next_account_info(account_info_iter)?;
+    let [token_account_info, _mint_info, elgamal_registry_account, remaining @ ..] = accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
 
-    check_elgamal_registry_program_account(elgamal_registry_account.owner)?;
+    check_elgamal_registry_program_account(elgamal_registry_account.owner())?;
 
     // if a payer account for reallcation is provided, then reallocate
-    if let Ok(payer_info) = next_account_info(account_info_iter) {
-        let system_program_info = next_account_info(account_info_iter)?;
+    if !remaining.is_empty() {
+        let [payer_info, system_program_info, ..] = remaining else {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        };
         reallocate_for_configure_account_with_registry(
             token_account_info,
             payer_info,
@@ -144,7 +150,7 @@ fn process_configure_account_with_registry(
         )?;
     }
 
-    let elgamal_registry_account_data = &elgamal_registry_account.data.borrow();
+    let elgamal_registry_account_data = &elgamal_registry_account.try_borrow()?;
     let elgamal_registry_account =
         bytemuck::try_from_bytes::<ElGamalRegistry>(elgamal_registry_account_data)
             .map_err(|_| ProgramError::InvalidArgument)?;
@@ -163,12 +169,12 @@ fn process_configure_account_with_registry(
 }
 
 fn reallocate_for_configure_account_with_registry<'a>(
-    token_account_info: &AccountInfo<'a>,
-    payer_info: &AccountInfo<'a>,
-    system_program_info: &AccountInfo<'a>,
+    token_account_info: &mut AccountView,
+    payer_info: &AccountView,
+    system_program_info: &AccountView,
 ) -> ProgramResult {
     let mut current_extension_types = {
-        let token_account = token_account_info.data.borrow();
+        let token_account = token_account_info.try_borrow()?;
         let account = PodStateWithExtensions::<PodAccount>::unpack(&token_account)?;
         account.get_extension_types()?
     };
@@ -191,7 +197,8 @@ fn reallocate_for_configure_account_with_registry<'a>(
         "account needs resize, +{:?} bytes",
         needed_account_len - token_account_info.data_len()
     );
-    token_account_info.resize(needed_account_len)?;
+    // SAFETY: `token_account_info` is not borrowed at this point.
+    unsafe { token_account_info.resize_unchecked(needed_account_len)? };
 
     // if additional lamports needed to remain rent-exempt, transfer them
     let rent = Rent::get()?;
@@ -200,7 +207,8 @@ fn reallocate_for_configure_account_with_registry<'a>(
     let current_lamport_reserve = token_account_info.lamports();
     let lamports_diff = new_rent_exempt_reserve.saturating_sub(current_lamport_reserve);
     if lamports_diff > 0 {
-        invoke(
+        // TODO: use system helper
+        /*invoke(
             &system_instruction::transfer(payer_info.key, token_account_info.key, lamports_diff),
             &[
                 payer_info.clone(),
@@ -208,10 +216,11 @@ fn reallocate_for_configure_account_with_registry<'a>(
                 system_program_info.clone(),
             ],
         )?;
+        */
     }
 
     // set account_type, if needed
-    let mut token_account_data = token_account_info.data.borrow_mut();
+    let mut token_account_data = token_account_info.try_borrow_mut()?;
     set_account_type::<Account>(&mut token_account_data)?;
 
     Ok(())
@@ -220,14 +229,15 @@ fn reallocate_for_configure_account_with_registry<'a>(
 /// Processes a [`ConfigureAccount`] instruction.
 fn process_configure_account(
     program_id: &Address,
-    accounts: &[AccountInfo],
+    accounts: &mut [AccountView],
     decryptable_zero_balance: &DecryptableBalance,
     maximum_pending_balance_credit_counter: &U64,
     elgamal_pubkey_source: ElGamalPubkeySource,
 ) -> ProgramResult {
-    let account_info_iter = &mut accounts.iter();
-    let token_account_info = next_account_info(account_info_iter)?;
-    let mint_info = next_account_info(account_info_iter)?;
+    let [token_account_info, mint_info, remaining @ ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let account_info_iter = &mut remaining.iter_mut();
 
     let elgamal_pubkey = match elgamal_pubkey_source {
         ElGamalPubkeySource::ProofInstructionOffset(offset) => {
@@ -239,22 +249,22 @@ fn process_configure_account(
             proof_context.pubkey
         }
         ElGamalPubkeySource::ElGamalRegistry(elgamal_registry_account) => {
-            let _elgamal_registry_account = next_account_info(account_info_iter)?;
+            let _elgamal_registry_account = next_account_view(account_info_iter)?;
             elgamal_registry_account.elgamal_pubkey
         }
     };
 
-    check_program_account(token_account_info.owner)?;
-    let token_account_data = &mut token_account_info.data.borrow_mut();
+    check_program_account(token_account_info.owner())?;
+    let token_account_data = &mut token_account_info.try_borrow_mut()?;
     let mut token_account = PodStateWithExtensionsMut::<PodAccount>::unpack(token_account_data)?;
 
-    if token_account.base.mint != *mint_info.key {
+    if token_account.base.mint != *mint_info.address() {
         return Err(TokenError::MintMismatch.into());
     }
 
     match elgamal_pubkey_source {
         ElGamalPubkeySource::ProofInstructionOffset(_) => {
-            let authority_info = next_account_info(account_info_iter)?;
+            let authority_info = next_account_view(account_info_iter)?;
             let authority_info_data_len = authority_info.data_len();
 
             Processor::validate_owner(
@@ -275,8 +285,8 @@ fn process_configure_account(
         }
     };
 
-    check_program_account(mint_info.owner)?;
-    let mint_data = &mut mint_info.data.borrow();
+    check_program_account(mint_info.owner())?;
+    let mint_data = &mut mint_info.try_borrow()?;
     let mint = PodStateWithExtensions::<PodMint>::unpack(mint_data)?;
     let confidential_transfer_mint = mint.get_extension::<ConfidentialTransferMint>()?;
 
@@ -315,22 +325,21 @@ fn process_configure_account(
 }
 
 /// Processes an [`ApproveAccount`] instruction.
-fn process_approve_account(accounts: &[AccountInfo]) -> ProgramResult {
-    let account_info_iter = &mut accounts.iter();
-    let token_account_info = next_account_info(account_info_iter)?;
-    let mint_info = next_account_info(account_info_iter)?;
-    let authority_info = next_account_info(account_info_iter)?;
+fn process_approve_account(accounts: &mut [AccountView]) -> ProgramResult {
+    let [token_account_info, mint_info, authority_info, ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
 
-    check_program_account(token_account_info.owner)?;
-    let token_account_data = &mut token_account_info.data.borrow_mut();
+    check_program_account(token_account_info.owner())?;
+    let token_account_data = &mut token_account_info.try_borrow_mut()?;
     let mut token_account = PodStateWithExtensionsMut::<PodAccount>::unpack(token_account_data)?;
 
-    if *mint_info.key != token_account.base.mint {
+    if *mint_info.address() != token_account.base.mint {
         return Err(TokenError::MintMismatch.into());
     }
 
-    check_program_account(mint_info.owner)?;
-    let mint_data = &mint_info.data.borrow_mut();
+    check_program_account(mint_info.owner())?;
+    let mint_data = &mint_info.try_borrow_mut()?;
     let mint = PodStateWithExtensions::<PodMint>::unpack(mint_data)?;
     let confidential_transfer_mint = mint.get_extension::<ConfidentialTransferMint>()?;
     let maybe_confidential_transfer_mint_authority: Option<Address> =
@@ -338,7 +347,9 @@ fn process_approve_account(accounts: &[AccountInfo]) -> ProgramResult {
     let confidential_transfer_mint_authority =
         maybe_confidential_transfer_mint_authority.ok_or(TokenError::NoAuthorityExists)?;
 
-    if authority_info.is_signer && *authority_info.key == confidential_transfer_mint_authority {
+    if authority_info.is_signer()
+        && *authority_info.address() == confidential_transfer_mint_authority
+    {
         let confidential_transfer_state =
             token_account.get_extension_mut::<ConfidentialTransferAccount>()?;
         confidential_transfer_state.approved = true.into();
@@ -351,11 +362,13 @@ fn process_approve_account(accounts: &[AccountInfo]) -> ProgramResult {
 /// Processes an [`EmptyAccount`] instruction.
 fn process_empty_account(
     program_id: &Address,
-    accounts: &[AccountInfo],
+    accounts: &mut [AccountView],
     proof_instruction_offset: i64,
 ) -> ProgramResult {
-    let account_info_iter = &mut accounts.iter();
-    let token_account_info = next_account_info(account_info_iter)?;
+    let [token_account_info, remainder @ ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let account_info_iter = &mut remainder.iter_mut();
 
     // zero-knowledge proof certifies that the available balance ciphertext holds
     // the balance of 0.
@@ -364,11 +377,11 @@ fn process_empty_account(
         ZeroCiphertextProofContext,
     >(account_info_iter, proof_instruction_offset, None)?;
 
-    let authority_info = next_account_info(account_info_iter)?;
+    let authority_info = next_account_view(account_info_iter)?;
     let authority_info_data_len = authority_info.data_len();
 
-    check_program_account(token_account_info.owner)?;
-    let token_account_data = &mut token_account_info.data.borrow_mut();
+    check_program_account(token_account_info.owner())?;
+    let token_account_data = &mut token_account_info.try_borrow_mut()?;
     let mut token_account = PodStateWithExtensionsMut::<PodAccount>::unpack(token_account_data)?;
 
     Processor::validate_owner(
@@ -1311,7 +1324,7 @@ fn process_allow_non_confidential_credits(
 #[allow(dead_code)]
 pub(crate) fn process_instruction(
     program_id: &Address,
-    accounts: &[AccountInfo],
+    accounts: &mut [AccountView],
     input: &[u8],
 ) -> ProgramResult {
     check_program_account(program_id)?;
